@@ -1,0 +1,12 @@
+# Secrets and local notes: never commit
+.env
+.env.prod
+
+# The three service repos live in their own repositories
+docmind-web-service/
+docmind-api-service/
+docmind-ai-service/
+
+.DS_Store
+.vscode/
+.idea/

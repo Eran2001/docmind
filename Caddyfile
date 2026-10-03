@@ -1,0 +1,15 @@
+# Serves the web app and the API from ONE address, so the browser sees a single site: the refresh cookie just works, no CORS.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The API (including the chat stream, which must not be buffered).
+	handle /api/v1/* {
+		reverse_proxy api:4000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}

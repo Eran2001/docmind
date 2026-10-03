@@ -1,0 +1,149 @@
+# Production-style stack: Postgres (pgvector), Redis, AI service, API, worker and web.
+# Web (3000) and API (4000) are published on localhost only; the database, Redis and the AI service stay on the private network.
+# On a server, start the `proxy` profile: Caddy serves both on one HTTPS address (see Caddyfile and the README).
+#
+#   cp .env.prod.example .env.prod     # fill in the secrets
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# On a server: add `--profile proxy` and set DOMAIN and TRUST_PROXY=true in .env.prod.
+x-api: &api
+  build: ./docmind-api-service
+  restart: unless-stopped
+  environment: &api-env
+    NODE_ENV: production
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    DATABASE_URL: postgres://docmind:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/docmind
+    REDIS_URL: redis://redis:6379
+    JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+    INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY}
+    AI_SERVICE_URL: http://ai:8000
+    WEB_ORIGIN: ${WEB_ORIGIN:?set WEB_ORIGIN}
+    STORAGE_DIR: /data/storage
+    MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
+    TRUST_PROXY: ${TRUST_PROXY:-false}
+    RERANK_ENABLED: ${RERANK_ENABLED:-false}
+  volumes:
+    - storage:/data/storage
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docmind
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: docmind
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmind -d docmind"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ai:
+    build:
+      context: ./docmind-ai-service
+      args:
+        WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-false}
+    restart: unless-stopped
+    environment:
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-5}
+      LLM_FAST_MODEL: ${LLM_FAST_MODEL:-gpt-5-mini}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
+      LLM_JUDGE_MODEL: ${LLM_JUDGE_MODEL:-}
+      EMBEDDING_MODEL: text-embedding-3-small
+      EMBEDDING_DIMENSIONS: "1536"
+      LIBREOFFICE_PATH: ${LIBREOFFICE_PATH:-}
+      LOG_LEVEL: ${AI_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # Runs once and exits: applies database migrations before the API and worker start.
+  migrate:
+    <<: *api
+    restart: "no"
+    command: ["node", "dist/database/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *api
+    command: ["node", "dist/main.js"]
+    ports:
+      - "127.0.0.1:${API_PORT:-4000}:4000"
+    environment:
+      <<: *api-env
+      API_PORT: "4000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+
+  worker:
+    <<: *api
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./docmind-web-service
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:?set NEXT_PUBLIC_SITE_URL}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    depends_on:
+      - api
+
+  # Only with `--profile proxy`: HTTPS (automatic Let's Encrypt certificate) on 80/443, one address for web and API.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["proxy"]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - web
+      - api
+
+volumes:
+  caddy_data:
+  pgdata:
+  redisdata:
+  storage:
